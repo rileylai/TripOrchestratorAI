@@ -1,0 +1,84 @@
+server:
+  port: 8082
+
+spring:
+  config:
+    import: optional:file:.env[.properties]
+  profiles:
+    active: dev
+  datasource:
+    url: "${DATABASE_URL:}"
+    username: "${DATABASE_USERNAME:}"
+    password: "${DATABASE_PASSWORD:}"
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  ai:
+    openai:
+      api-key: "${OPENAI_API_KEY:}"
+      model-name: "gpt-4o-mini"
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 100MB
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+
+logging:
+  level:
+    org.springframework.jdbc.support.JdbcTransactionManager: debug
+
+jwt:
+  token:
+    secret: "${JWT_SECRET:}"
+    expireTime: 3600000
+
+aws:
+  region: ap-southeast-2
+  accesskeyId: "${AWS_ACCESS_KEY_ID:}"
+  secretAccessKey: "${AWS_SECRET_ACCESS_KEY:}"
+  s3:
+    bucket-name: 
+    dir-name: 
+    cdn: 
+
+sendgrid:
+  api-key: "${SENDGRID_API_KEY:}"
+  from: 
+
+frontend:
+  base-url: "http://localhost:5173"
+
+default:
+  avatar-url: "https://awscdn.dingzh.cc/elec5620-stage2/avatars/default_avatar.png"
+
+openweather:
+  api:
+    key: "${OPENWEATHER_API_KEY:}"
+
+unsplash:
+  access-key: "${UNSPLASH_ACCESS_KEY:}"
+
+google:
+  maps:
+    api-key: "${GOOGLE_MAPS_API_KEY:}"
+
+feign:
+  httpclient:
+    enabled: true
+  okhttp:
+    enabled: false
+  client:
+    config:
+      default:
+        connectTimeout: 2000
+        readTimeout: 2000
+        loggerLevel: BASIC
+
+booking:
+  base-url: http://localhost:8092/api/booking
+  service:
+    base-url: ${booking.base-url}
