@@ -1,0 +1,45 @@
+package com.demo.api.model;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.time.LocalDate;
+
+/**
+ * Daily overview for generated trip itineraries.
+ */
+@Entity
+@Table(name = "trip_daily_summary", indexes = {
+        @Index(name = "idx_trip_daily_summary_trip_id", columnList = "trip_id"),
+        @Index(name = "idx_trip_daily_summary_trip_id_date", columnList = "trip_id,date")
+})
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class TripDailySummary extends BaseModel{
+
+    // Primary key for the daily summary entry.
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    // Identifier of the related trip preference request.
+    @Column(name = "trip_id", nullable = false)
+    private Long tripId;
+
+    @Column(nullable = false)
+    private LocalDate date;
+
+    @Column(name = "image_url")
+    private String imageUrl;
+
+    @Column(name = "image_description")
+    private String imageDescription;
+
+    @Column(length = 4096)
+    private String summary;
+}

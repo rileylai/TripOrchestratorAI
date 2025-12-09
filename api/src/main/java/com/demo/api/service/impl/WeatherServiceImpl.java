@@ -1,0 +1,325 @@
+package com.demo.api.service.impl;
+
+import com.demo.api.dto.DailyWeatherDTO;
+import com.demo.api.model.Trip;
+import com.demo.api.model.TripWeather;
+import com.demo.api.repository.TripWeatherRepository;
+import com.demo.api.service.WeatherService;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.RequiredArgsConstructor;
+import org.modelmapper.ModelMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.web.util.UriComponentsBuilder;
+
+import java.net.URI;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.util.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+/**
+ * This service communicates with the OpenWeatherMap API to fetch
+ * the 5-day/3-hour forecast, summarize daily weather information,
+ * and store it into the database for a given trip.
+ *
+ * ⚠️ Note: Only supports forecast for trips starting within 5 days from today.
+ */
+@Service
+@RequiredArgsConstructor
+public class WeatherServiceImpl implements WeatherService {
+
+    private static final Logger log = LoggerFactory.getLogger(WeatherServiceImpl.class);
+    private static final String FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast";
+
+    private final RestTemplate restTemplate;
+    private final TripWeatherRepository tripWeatherRepository;
+    private final ModelMapper modelMapper;
+    private final ObjectMapper objectMapper;
+
+    @Value("${openweather.api.key}")
+    private String apiKey;
+
+    /**
+     * Main entry point for this service.
+     *
+     * 1. Validates input trip preference
+     * 2. Builds forecast API URL
+     * 3. Calls OpenWeatherMap to fetch 5-day forecast
+     * 4. Groups 3-hour entries by day
+     * 5. Summarizes daily weather (min/max temperature and condition)
+     * 6. Saves summarized results into TripWeather table
+     */
+    @Override
+    @Transactional
+    public void fetchAndStoreWeather(Trip preference) {
+        validatePreference(preference);  // Check tripId and city presence
+
+        // 1. Build API URL based on trip city and country
+        URI uri = buildForecastUri(preference);
+
+        // 2. Call the OpenWeatherMap API via RestTemplate
+        String responseJson;
+        try{
+            responseJson = restTemplate.getForObject(uri, String.class);
+        } catch (HttpClientErrorException.NotFound e){
+            log.warn("Skip weather: OpenWeather 404 for q='{},{}'", preference.getToCity(), preference.getToCountry());
+            return;
+        } catch (RestClientException e){
+            log.warn("Skip weather: OpenWeather call failed: {}", e.getMessage());
+            return;
+        }
+        if (!StringUtils.hasText(responseJson)) {
+            log.warn("Skip weather: empty response for trip {}", preference.getId());
+            return;
+        }
+        if (responseJson.contains("\"cod\":\"404\"") || responseJson.contains("\"cod\":404")) {
+            log.warn("Skip weather: response cod=404 (city not found) for trip {}", preference.getId());
+            return;
+        }
+        log.debug("OpenWeatherMap raw response: {}", responseJson);
+
+        // 3. Parse JSON response into structured objects
+        OpenWeatherForecastResponse forecastResponse = parseResponse(responseJson);
+        if (forecastResponse == null || forecastResponse.getList() == null || forecastResponse.getList().isEmpty()) {
+            log.warn("No forecast data returned for trip {}", preference.getId());
+            return;
+        }
+
+        // Extract timezone offset from response (in seconds)
+        Integer timezoneOffsetSeconds = Optional.ofNullable(forecastResponse.getCity())
+                .map(City::getTimezone)
+                .orElse(0);
+
+        // 4. Group 3-hour forecast entries by date (local time)
+        Map<LocalDate, List<ForecastEntry>> groupedByDate = forecastResponse.getList().stream()
+                .filter(Objects::nonNull)
+                .collect(Collectors.groupingBy(entry -> toLocalDate(entry, timezoneOffsetSeconds)));
+
+        // 5. Generate daily summaries (min/max temp, dominant condition)
+        List<DailyWeatherDTO> dailySummaries = groupedByDate.entrySet().stream()
+                .map(entry -> buildDailySummary(entry.getKey(), entry.getValue()))
+                .sorted(Comparator.comparing(DailyWeatherDTO::getDate))
+                .toList();
+
+        // Filter summaries to the trip's date window (if defined)
+        List<DailyWeatherDTO> filteredSummaries = dailySummaries.stream()
+                .filter(dto -> isWithinTripWindow(dto.getDate(), preference))
+                .toList();
+
+        if (filteredSummaries.isEmpty()) {
+            log.info("No weather summaries within trip window for trip {}", preference.getId());
+            return;
+        }
+
+        // 6. Upsert TripWeather entities for the filtered summaries
+        Map<LocalDate, TripWeather> existingByDate = tripWeatherRepository.findByTripId(preference.getId())
+                .stream()
+                .collect(Collectors.toMap(TripWeather::getDate, Function.identity()));
+
+        List<TripWeather> toSave = new ArrayList<>();
+        for (DailyWeatherDTO summary : filteredSummaries) {
+            TripWeather weather = existingByDate.get(summary.getDate());
+            if (weather == null) {
+                weather = modelMapper.map(summary, TripWeather.class);
+                weather.setTripId(preference.getId());
+                existingByDate.put(summary.getDate(), weather);
+            } else {
+                weather.setMinTemp(summary.getMinTemp());
+                weather.setMaxTemp(summary.getMaxTemp());
+                weather.setWeatherCondition(summary.getWeatherCondition());
+            }
+            toSave.add(weather);
+        }
+
+        tripWeatherRepository.saveAll(toSave);
+
+        log.info("Stored {} daily weather records for trip {}", toSave.size(), preference.getId());
+    }
+
+    // ---------------- Helper Methods ---------------- //
+
+    /**
+     * Validates the trip preference input before API call.
+     */
+    private void validatePreference(Trip preference) {
+        if (preference == null) {
+            throw new IllegalArgumentException("Trip preference is required");
+        }
+        if (preference.getId() == null) {
+            throw new IllegalArgumentException("Trip preference must include a tripId");
+        }
+        if (!StringUtils.hasText(preference.getToCity())) {
+            throw new IllegalArgumentException("Trip preference must include a city");
+        }
+    }
+
+    private boolean isWithinTripWindow(LocalDate date, Trip preference) {
+        LocalDate start = preference.getStartDate();
+        LocalDate end = preference.getEndDate();
+        if (start != null && date.isBefore(start)) {
+            return false;
+        }
+        if (end != null && date.isAfter(end)) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Constructs the full URI for OpenWeatherMap forecast API.
+     */
+    private URI buildForecastUri(Trip preference) {
+        String location = Stream.of(preference.getToCity(), preference.getToCountry())
+                .filter(StringUtils::hasText)
+                .collect(Collectors.joining(","));
+
+        return UriComponentsBuilder.fromHttpUrl(FORECAST_URL)
+                .queryParam("q", location)
+                .queryParam("appid", apiKey)
+                .queryParam("units", "metric")
+                .build()
+                .encode()
+                .toUri();
+    }
+
+    /**
+     * Parses the raw JSON string into a structured response object.
+     */
+    private OpenWeatherForecastResponse parseResponse(String responseJson) {
+        try {
+            return objectMapper.readValue(responseJson, OpenWeatherForecastResponse.class);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("Unable to parse weather response", ex);
+        }
+    }
+
+    /**
+     * Converts the Unix timestamp (dt) into a local date, considering timezone offset.
+     */
+    private LocalDate toLocalDate(ForecastEntry entry, Integer timezoneOffsetSeconds) {
+        ZoneOffset zoneOffset = ZoneOffset.UTC;
+        if (timezoneOffsetSeconds != null) {
+            try {
+                zoneOffset = ZoneOffset.ofTotalSeconds(timezoneOffsetSeconds);
+            } catch (Exception ignored) {
+                // Fallback to UTC if timezone is invalid
+            }
+        }
+
+        return Instant.ofEpochSecond(entry.getDt())
+                .atOffset(zoneOffset)
+                .toLocalDate();
+    }
+
+    /**
+     * Builds a single-day weather summary (min temp, max temp, main condition)
+     * based on multiple 3-hour forecast entries.
+     */
+    private DailyWeatherDTO buildDailySummary(LocalDate date, List<ForecastEntry> entries) {
+        // Compute min and max temperature
+        Double minTemp = entries.stream()
+                .map(ForecastEntry::getMain)
+                .filter(Objects::nonNull)
+                .map(MainData::getTempMin)
+                .filter(Objects::nonNull)
+                .min(Double::compareTo)
+                .orElse(null);
+
+        Double maxTemp = entries.stream()
+                .map(ForecastEntry::getMain)
+                .filter(Objects::nonNull)
+                .map(MainData::getTempMax)
+                .filter(Objects::nonNull)
+                .max(Double::compareTo)
+                .orElse(null);
+
+        // Find the most frequent weather condition (e.g., "Cloudy", "Rain")
+        String dominantCondition = entries.stream()
+                .flatMap(entry -> Optional.ofNullable(entry.getWeather()).orElse(List.of()).stream())
+                .map(WeatherDescription::getMain)
+                .filter(StringUtils::hasText)
+                .collect(Collectors.collectingAndThen(
+                        Collectors.groupingBy(condition -> condition, Collectors.counting()),
+                        freq -> freq.entrySet().stream()
+                                .max(Comparator.<Map.Entry<String, Long>>comparingLong(Map.Entry::getValue)
+                                        .thenComparing(Map.Entry::getKey))
+                                .map(Map.Entry::getKey)
+                                .orElse(null)
+                ));
+
+        return DailyWeatherDTO.builder()
+                .date(date)
+                .minTemp(minTemp)
+                .maxTemp(maxTemp)
+                .weatherCondition(dominantCondition)
+                .build();
+    }
+
+    // ---------------- JSON Response Mapping Classes ---------------- //
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static class OpenWeatherForecastResponse {
+        private List<ForecastEntry> list;  // List of forecast items
+        private City city;                 // City info (includes timezone)
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static class ForecastEntry {
+        private long dt;                   // Forecast timestamp
+        private MainData main;             // Temperature info
+        private List<WeatherDescription> weather;  // Weather condition list
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static class MainData {
+        @JsonProperty("temp_min")
+        private Double tempMin;            // Minimum temperature
+        @JsonProperty("temp_max")
+        private Double tempMax;            // Maximum temperature
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static class WeatherDescription {
+        private String main;               // Main weather condition (e.g. "Cloudy")
+        private String description;        // Detailed description (e.g. "broken clouds")
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static class City {
+        private String name;
+        private String country;
+        private Integer timezone;          // Offset in seconds from UTC
+    }
+}
